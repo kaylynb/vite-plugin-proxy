@@ -1,8 +1,8 @@
 import createDebugger from 'debug'
-import { IncomingMessage, ServerResponse } from 'http'
+import type { IncomingMessage, ServerResponse } from 'http'
 import http2proxy, { http1WebOptions, wsHttp1Options } from 'http2-proxy'
-import { Socket } from 'net'
-import { Duplex } from 'stream'
+import type { Socket } from 'net'
+import type { Duplex } from 'stream'
 import type { ConnectionOptions } from 'tls'
 import type { Plugin } from 'vite'
 
@@ -44,11 +44,35 @@ type ProxyHttpOptions = Omit<
 	'onReq' | 'onRes'
 >
 
+export type ProxyErrorCommon = {
+	err: Error
+	req: IncomingMessage
+	context: string
+	target: URL
+}
+
+export type WebError = ProxyErrorCommon & {
+	type: 'web'
+	res: ServerResponse
+	next: (err?: unknown) => void
+}
+
+export type SocketError = ProxyErrorCommon & {
+	type: 'socket'
+	socket: Socket
+	head: Buffer
+}
+
+export type ProxyError = WebError | SocketError
+
+export type ProxyErrorHandler = (error: ProxyError) => Error | void
+
 export type ProxyOptions = Partial<ProxyHttpOptions> & {
 	target: string
 	rewrite?: (path: string) => string
 	secure?: boolean
 	ws?: boolean
+	onError?: ProxyErrorHandler
 }
 
 export type ProxyPluginOptions = Record<string, string | ProxyOptions>
@@ -92,7 +116,10 @@ const getProtocol = (
 const getPort = (url: URL): number =>
 	url.port === '' ? { http: 80, https: 443 }[getProtocol(url)] : +url.port
 
-export const getMiddleware = (options: ProxyPluginOptions) => {
+export const getMiddleware = (
+	options: ProxyPluginOptions,
+	defaultErrorHandler?: ProxyErrorHandler,
+) => {
 	const proxyEntries = new Map<string, ProxyOptions>(
 		Object.entries(options).map(([context, opts]): [string, ProxyOptions] => {
 			if (typeof opts === 'string') {
@@ -104,6 +131,17 @@ export const getMiddleware = (options: ProxyPluginOptions) => {
 			// Convert `secure` to `rejectUnauthorized` to allow easier migration from vite `proxy` config
 			if (newOpts.rejectUnauthorized === undefined && opts.secure === false) {
 				newOpts.rejectUnauthorized = false
+			}
+
+			if (defaultErrorHandler) {
+				const userOnError = newOpts.onError
+				newOpts.onError = (error) => {
+					const newError = userOnError?.(error)
+
+					if (newError !== undefined) {
+						defaultErrorHandler(error)
+					}
+				}
 			}
 
 			return [context, newOpts]
@@ -132,7 +170,7 @@ export const getMiddleware = (options: ProxyPluginOptions) => {
 
 	const handleProxyMatches = (
 		req: IncomingMessage,
-		onMatch: (url: URL, context: string, opts: ProxyHttpOptions) => void,
+		onMatch: (url: URL, context: string, opts: ProxyOptions) => void,
 		matchOpts?: {
 			onMiss?: () => void
 			test?: (context: string, opts: ProxyOptions) => boolean
@@ -155,7 +193,7 @@ export const getMiddleware = (options: ProxyPluginOptions) => {
 					const targetUrl = new URL(url, opts.target)
 					debug(`targetUrl: ${targetUrl}`)
 
-					onMatch(targetUrl, context, getProxyHttpOptions(targetUrl, opts))
+					onMatch(targetUrl, context, opts)
 					return
 				} else {
 					matchOpts?.onMiss?.()
@@ -171,8 +209,23 @@ export const getMiddleware = (options: ProxyPluginOptions) => {
 	) =>
 		handleProxyMatches(
 			req,
-			(_, __, opts) => {
-				http2proxy.web(req, res, opts, (err) => err && next(err))
+			(target, context, opts) => {
+				http2proxy.web(
+					req,
+					res,
+					getProxyHttpOptions(target, opts),
+					(err, req, res) =>
+						err &&
+						opts.onError?.({
+							type: 'web',
+							err,
+							req,
+							res,
+							context,
+							target,
+							next,
+						}),
+				)
 			},
 			{
 				onMiss: () => next(),
@@ -186,8 +239,24 @@ export const getMiddleware = (options: ProxyPluginOptions) => {
 	) =>
 		handleProxyMatches(
 			req,
-			(_, __, opts) => {
-				http2proxy.ws(req, socket as Socket, head, opts)
+			(target, context, opts) => {
+				http2proxy.ws(
+					req,
+					socket as Socket,
+					head,
+					getProxyHttpOptions(target, opts),
+					(err, req, socket, head) =>
+						err &&
+						opts.onError?.({
+							type: 'socket',
+							err,
+							req,
+							socket,
+							head,
+							context,
+							target,
+						}),
+				)
 			},
 			{
 				test: (_: string, opts: ProxyOptions) =>
@@ -200,11 +269,22 @@ export const getMiddleware = (options: ProxyPluginOptions) => {
 }
 
 export const proxy = (options: ProxyPluginOptions): Plugin => {
-	const { webSocketHandler, proxyMiddleware } = getMiddleware(options)
-
 	return {
 		name: pluginName,
 		configureServer: (server) => {
+			const { webSocketHandler, proxyMiddleware } = getMiddleware(
+				options,
+				({ err }) => {
+					server.config.logger.error(
+						`[${pluginName}] http2 proxy error: ${err.stack}\n`,
+						{
+							timestamp: true,
+							error: err,
+						},
+					)
+				},
+			)
+
 			server.httpServer?.on('upgrade', webSocketHandler)
 			server.middlewares.use(proxyMiddleware)
 		},
